@@ -428,8 +428,9 @@ def build_dense_pointcloud(
         if curr_w != ref_w or curr_h != ref_h:
             img_bgr = cv2.resize(img_bgr, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
 
-        # Crop original RGB
-        cropped_rgb = img_bgr[top_crop:bottom_crop, :, ::-1]
+        # Crop original RGB and ensure positive contiguous strides (BGR -> RGB)
+        cropped_bgr = img_bgr[top_crop:bottom_crop, :]
+        cropped_rgb = np.ascontiguousarray(cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB))
 
         # Upscale depth with bicubic interpolation
         d_slice = low_depth[i].squeeze(-1)
@@ -867,19 +868,19 @@ def process_scene(
         splat_path = scene_out_dir / splat_filename
 
         if args.dense and dense_depths is not None:
-            splat_depths = [torch.from_numpy(d) for d in dense_depths]
-            splat_rgbs = [torch.from_numpy(c) for c in dense_colors]
+            splat_depths = [torch.from_numpy(np.ascontiguousarray(d)) for d in dense_depths]
+            splat_rgbs = [torch.from_numpy(np.ascontiguousarray(c)) for c in dense_colors]
         else:
             splat_depths = [
-                torch.from_numpy(np_predictions["depth"][i].squeeze(-1))
+                torch.from_numpy(np.ascontiguousarray(np_predictions["depth"][i].squeeze(-1)))
                 for i in range(len(image_paths))
             ]
             splat_rgbs = [
-                torch.from_numpy((np_predictions["images"][i].transpose(1, 2, 0) * 255.0).astype(np.uint8))
+                torch.from_numpy(np.ascontiguousarray((np_predictions["images"][i].transpose(1, 2, 0) * 255.0).astype(np.uint8)))
                 for i in range(len(image_paths))
             ]
 
-        extri_tensor = torch.from_numpy(extrinsics_np)
+        extri_tensor = torch.from_numpy(np.ascontiguousarray(extrinsics_np))
 
         t_sp = time.perf_counter()
         sp_pts, sp_rgb, sp_sc, sp_qt = build_multiview_gaussian_splats(
