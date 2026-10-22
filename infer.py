@@ -140,6 +140,12 @@ def parse_args():
         help="Also export a 3D trimesh scene as .glb with camera meshes."
     )
     parser.add_argument(
+        "--show_cam",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to include 3D camera cones in the exported GLB scene (default: True)."
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -633,6 +639,93 @@ def build_multiview_gaussian_splats(
     return flat_pts, flat_rgb, flat_scales, flat_quats
 
 
+# -------------------------- 3D Visualization Helpers --------------------------
+def get_opengl_conversion_matrix() -> np.ndarray:
+    matrix = np.identity(4)
+    matrix[1, 1] = -1
+    matrix[2, 2] = -1
+    return matrix
+
+
+def transform_points(transformation: np.ndarray, points: np.ndarray, dim: int = None) -> np.ndarray:
+    points = np.asarray(points)
+    initial_shape = points.shape[:-1]
+    dim = dim or points.shape[-1]
+    transformation = transformation.swapaxes(-1, -2)
+    points = points @ transformation[..., :-1, :] + transformation[..., -1:, :]
+    return points[..., :dim].reshape(*initial_shape, dim)
+
+
+def compute_camera_faces(cone_shape) -> np.ndarray:
+    faces_list = []
+    num_vertices_cone = len(cone_shape.vertices)
+    for face in cone_shape.faces:
+        if 0 in face:
+            continue
+        v1, v2, v3 = face
+        v1_offset, v2_offset, v3_offset = face + num_vertices_cone
+        v1_offset_2, v2_offset_2, v3_offset_2 = face + 2 * num_vertices_cone
+        faces_list.extend([
+            (v1, v2, v2_offset),
+            (v1, v1_offset, v3),
+            (v3_offset, v2, v3),
+            (v1, v2, v2_offset_2),
+            (v1, v1_offset_2, v3),
+            (v3_offset_2, v2, v3),
+        ])
+    faces_list += [(v3, v2, v1) for v1, v2, v3 in faces_list]
+    return np.array(faces_list)
+
+
+def add_camera_cones_to_scene(scene_3d, extrinsics_np: np.ndarray, scene_scale: float):
+    """Add colored 3D camera cone meshes into a Trimesh scene."""
+    try:
+        import trimesh
+        from scipy.spatial.transform import Rotation
+        import matplotlib.cm as cm
+
+        num_cameras = len(extrinsics_np)
+        extrinsics_4x4 = np.zeros((num_cameras, 4, 4))
+        extrinsics_4x4[:, :3, :4] = extrinsics_np
+        extrinsics_4x4[:, 3, 3] = 1.0
+
+        cam_width = scene_scale * 0.02
+        cam_height = scene_scale * 0.02
+        rot_45 = np.eye(4)
+        rot_45[:3, :3] = Rotation.from_euler("z", 45, degrees=True).as_matrix()
+        rot_45[2, 3] = -cam_height
+        opengl_matrix = get_opengl_conversion_matrix()
+
+        cone = trimesh.creation.cone(cam_width, cam_height, sections=4)
+        slight_rot = np.eye(4)
+        slight_rot[:3, :3] = Rotation.from_euler("z", 2, degrees=True).as_matrix()
+
+        vertices_combined = np.concatenate([
+            cone.vertices,
+            0.95 * cone.vertices,
+            transform_points(slight_rot, cone.vertices)
+        ])
+        mesh_faces = compute_camera_faces(cone)
+
+        try:
+            cmap = cm.get_cmap("rainbow")
+        except AttributeError:
+            cmap = cm.rainbow
+
+        for i in range(num_cameras):
+            camera_to_world = extrinsics_4x4[i]
+            rgba = cmap(i / max(1, num_cameras - 1))
+            face_colors = tuple(int(255 * x) for x in rgba[:3])
+
+            complete_t = camera_to_world @ opengl_matrix @ rot_45
+            vertices_transformed = transform_points(complete_t, vertices_combined)
+            cam_mesh = trimesh.Trimesh(vertices=vertices_transformed, faces=mesh_faces)
+            cam_mesh.visual.face_colors[:, :3] = face_colors
+            scene_3d.add_geometry(cam_mesh)
+    except Exception as e:
+        print(f"Notice: Could not generate camera cone meshes ({e}). Skipping camera cones.")
+
+
 # -------------------------- Scene Processor --------------------------
 def process_scene(
     scene_name: str,
@@ -821,7 +914,13 @@ def process_scene(
             scene_3d = trimesh.Scene()
             pcd = trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
             scene_3d.add_geometry(pcd)
+
+            if args.show_cam:
+                scene_scale = float(np.max(np.abs(vertices_3d))) if len(vertices_3d) > 0 else 1.0
+                add_camera_cones_to_scene(scene_3d, extrinsics_np, scene_scale)
+
             scene_3d.export(str(glb_path))
+            print(f"Exported interactive GLB scene to: {glb_path}")
         except ImportError:
             print("Note: 'trimesh' not installed. Skipping .glb export.")
 

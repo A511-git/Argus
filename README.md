@@ -79,8 +79,11 @@ depth_conf = predictions["depth_conf"]  # [B, S, H, W]
 You can run automated, batch-capable 3D reconstruction and export photorealistic **3D Gaussian Splats** directly from the command line using `infer.py`:
 
 ```bash
-# Basic reconstruction (point cloud + camera poses + predictions)
+# Basic reconstruction (auto-downloads weights from HuggingFace if omitted)
 python infer.py --input path/to/scene_folder --output ./output
+
+# Specify a local model checkpoint
+python infer.py --input path/to/scene_folder --output ./output --model_path models/argus_realsee3d.pt
 
 # High-resolution dense reconstruction (capped to 2K by default)
 python infer.py --input path/to/scene_folder --output ./output --dense
@@ -88,8 +91,14 @@ python infer.py --input path/to/scene_folder --output ./output --dense
 # Generate photorealistic 3D Gaussian Splats (.ply) for SuperSplat / PlayCanvas / Luma
 python infer.py --input path/to/scene_folder --output ./output --splat --ply_scale 1.2
 
+# Outdoor scene reconstruction with extended depth cutoff (80m)
+python infer.py --input path/to/outdoor_scene --output ./output --splat --no-ply_is_indoor
+
+# Export interactive 3D GLB scene with color-coded camera frustums and open-top ceiling cut
+python infer.py --input path/to/scene_folder --output ./output --export_glb --show_cam --ceiling_remove 25.0
+
 # Batch process multiple scenes under a parent directory on Linux / Kaggle / Colab
-python infer.py --input /path/to/scenes_parent_folder --output /path/to/output --dense --splat
+python infer.py --input /path/to/scenes_parent_folder --output /path/to/output --dense --splat --model_path /path/to/argus_realsee3d.pt
 ```
 
 ### Generated Scene Outputs
@@ -104,19 +113,46 @@ output/
     └── Created_Scenes_pantry.glb                # Trimesh 3D scene with camera frustums (if --export_glb)
 ```
 
-### Key CLI Flags
-| Flag | Description | Default |
-| :--- | :--- | :---: |
-| `--input`, `-i` | Path to a single scene folder or parent folder containing multiple scene subfolders | *Required* |
-| `--output`, `-o` | Root output directory (e.g., `./output` or `/kaggle/working/output`) | `./output` |
-| `--dense` | Enable guided depth upsampling to match high-res photo dimensions with true RGB colors | `False` |
-| `--dense-resize` | Max width resolution cap for dense upsampling (`2048`/`2k`, `4096`/`4k`, or `orig`/`0`) | `2048` |
-| `--splat` | Generate 3D Gaussian Splatting `<scene_name>_splat.ply` on GPU | `False` |
-| `--ply_scale` | Global splat radius scale multiplier (ensures smooth surface overlap) | `1.2` |
-| `--ply_thickness` | Splat disc thickness ratio relative to tangent radius | `0.2` |
-| `--conf_thres` | Confidence cutoff percentile (set `0.0` to preserve all valid points) | `5.0` |
-| `--ceiling_remove` | Percentile of top Y points to remove as ceiling (set `0.0` to keep ceiling) | `0.0` |
-| `--export_glb` | Also export interactive `.glb` with 3D camera frustums | `False` |
+### Comprehensive CLI Reference
+
+#### 📁 Input & Model Configuration
+| Flag | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--input`, `-i` | `str` | *Required* | Path to a single scene folder or parent folder containing multiple scene subfolders. |
+| `--output`, `-o` | `str` | `./output` | Root output directory for generated scene folders and assets. |
+| `--model_path`, `-m` | `str` | `None` | Path to local model weights (`.pt`). Auto-downloads from HuggingFace if omitted or not found. |
+| `--device` | `str` | `None` | Compute device (`cuda`, `cpu`, or auto-detect if `None`). |
+
+#### 🖼️ Argus Native Preprocessing & Resolution
+| Flag | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--img_size` | `int` | `560` | Input panoramic target width (height = `img_size // 2`, standard Argus resolution is `280x560`). |
+| `--crop_ratio` | `float` | `0.15` | Vertical crop ratio on top and bottom of equirectangular panoramas (0.0 to 0.45) to exclude ceiling/tripod nadir artifacts. |
+| `--dense` | `flag` | `False` | Enable high-resolution guided depth upsampling to match input photo dimensions with true RGB color fidelity. |
+| `--dense-resize`, `--dense_resize` | `str` | `2048` | Maximum width resolution cap for dense upsampling (`2048`/`2k`, `4096`/`4k`, or `orig`/`0` for uncapped). |
+
+#### 🧹 Point Cloud & Filtering Controls
+| Flag | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--conf_thres` | `float` | `5.0` | Confidence cutoff percentile (0.0–100.0) to filter noisy points. Set `0.0` to preserve all valid points. |
+| `--ceiling_remove` | `float` | `0.0` | Percentile of top Y-coordinate ceiling points to prune (0.0–100.0). Set `25.0` for an open-top dollhouse floorplan view. |
+
+#### 🌟 3D Gaussian Splatting (`--splat`)
+| Flag | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--splat` | `flag` | `False` | Generate 17-column 3D Gaussian Splatting `<scene_name>_splat.ply` directly on GPU. |
+| `--ply_is_indoor` / `--no-ply_is_indoor` | `bool` | `True` | Scene depth cutoff preset. Indoor mode caps depth at 15m; `--no-ply_is_indoor` extends cutoff to 80m for outdoor environments. |
+| `--ply_stride` | `int` | `1` | Pixel subsampling stride for splats (`1` = full resolution, `2` = half resolution for faster web rendering). |
+| `--ply_scale` | `float` | `1.2` | Global splat radius scale multiplier (guarantees smooth tangential surface overlap without gaps). |
+| `--ply_thickness` | `float` | `0.2` | Splat disc thickness ratio relative to tangent radius. |
+| `--ply_min_depth` | `float` | `0.1` | Near plane depth threshold in meters. |
+| `--ply_max_depth` | `float` | `None` | Custom far plane depth cutoff in meters (overrides indoor 15m / outdoor 80m preset). |
+
+#### 🧊 3D Scene & GLB Export
+| Flag | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--export_glb` | `flag` | `False` | Export interactive 3D trimesh scene as `<scene_name>.glb`. |
+| `--show_cam` / `--no-show_cam` | `bool` | `True` | Include 3D color-coded camera cone frustums at estimated camera positions inside the GLB scene. |
 
 ## Interactive Demo
 
