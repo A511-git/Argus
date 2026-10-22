@@ -21,7 +21,7 @@
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/realsee-developer/Argus.git
+git clone https://github.com/A511-git/Argus.git
 cd Argus
 pip install -r requirements.txt
 pip install -e .
@@ -73,6 +73,50 @@ extrinsic, conf = pose_encoding_to_extri360(pose_encoding=predictions["pose_enc"
 depth = predictions["depth"]          # [B, S, H, W, 1]
 depth_conf = predictions["depth_conf"]  # [B, S, H, W]
 ```
+
+## 🚀 Standalone CLI Pipeline & 3D Gaussian Splatting
+
+You can run automated, batch-capable 3D reconstruction and export photorealistic **3D Gaussian Splats** directly from the command line using `infer.py`:
+
+```bash
+# Basic reconstruction (point cloud + camera poses + predictions)
+python infer.py --input path/to/scene_folder --output ./output
+
+# High-resolution dense reconstruction (capped to 2K by default)
+python infer.py --input path/to/scene_folder --output ./output --dense
+
+# Generate photorealistic 3D Gaussian Splats (.ply) for SuperSplat / PlayCanvas / Luma
+python infer.py --input path/to/scene_folder --output ./output --splat --ply_scale 1.2
+
+# Batch process multiple scenes under a parent directory on Linux / Kaggle / Colab
+python infer.py --input /path/to/scenes_parent_folder --output /path/to/output --dense --splat
+```
+
+### Generated Scene Outputs
+For each scene (e.g. `Created_Scenes_pantry`), `infer.py` automatically creates a dedicated folder with clean, standardized naming:
+```text
+output/
+└── Created_Scenes_pantry/
+    ├── Created_Scenes_pantry.ply                # Colored metric 3D point cloud
+    ├── Created_Scenes_pantry_splat.ply          # 17-column 3D Gaussian Splatting binary PLY (if --splat)
+    ├── Created_Scenes_pantry_predictions.npz    # Raw predictions archive (depths, extrinsics, confidences)
+    ├── Created_Scenes_pantry_camera_poses.json  # Formatted camera translations and 3x3 rotation matrices
+    └── Created_Scenes_pantry.glb                # Trimesh 3D scene with camera frustums (if --export_glb)
+```
+
+### Key CLI Flags
+| Flag | Description | Default |
+| :--- | :--- | :---: |
+| `--input`, `-i` | Path to a single scene folder or parent folder containing multiple scene subfolders | *Required* |
+| `--output`, `-o` | Root output directory (e.g., `./output` or `/kaggle/working/output`) | `./output` |
+| `--dense` | Enable guided depth upsampling to match high-res photo dimensions with true RGB colors | `False` |
+| `--dense-resize` | Max width resolution cap for dense upsampling (`2048`/`2k`, `4096`/`4k`, or `orig`/`0`) | `2048` |
+| `--splat` | Generate 3D Gaussian Splatting `<scene_name>_splat.ply` on GPU | `False` |
+| `--ply_scale` | Global splat radius scale multiplier (ensures smooth surface overlap) | `1.2` |
+| `--ply_thickness` | Splat disc thickness ratio relative to tangent radius | `0.2` |
+| `--conf_thres` | Confidence cutoff percentile (set `0.0` to preserve all valid points) | `5.0` |
+| `--ceiling_remove` | Percentile of top Y points to remove as ceiling (set `0.0` to keep ceiling) | `0.0` |
+| `--export_glb` | Also export interactive `.glb` with 3D camera frustums | `False` |
 
 ## Interactive Demo
 
