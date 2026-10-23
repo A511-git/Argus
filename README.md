@@ -154,6 +154,36 @@ output/
 | `--export_glb` | `flag` | `False` | Export interactive 3D trimesh scene as `<scene_name>.glb`. |
 | `--show_cam` / `--no-show_cam` | `bool` | `True` | Include 3D color-coded camera cone frustums at estimated camera positions inside the GLB scene. |
 | `--debug` | `flag` | `False` | Export per-panorama point clouds and splats inside `<scene>/debug/<scene> <idx>/` in aligned world coordinates. |
+| `--nested` | `flag` | `False` | Enable hierarchical multi-step reconstruction for nested scene trees (e.g. `/villa/1/1`), eliminating VRAM spikes and hallucinations. |
+
+### 🌳 Hierarchical Multi-Step Reconstruction (`--nested`)
+For complex, multi-room architectural spaces (e.g., a villa with connected bedrooms and bathrooms), passing all panoramas simultaneously into Argus can exhaust GPU VRAM and cause attention hallucinations across non-covisible spaces.
+
+With `--nested`, organize rooms into minimal complete subsets where child folders are named after the parent bridge image index:
+```text
+/villa/
+├── 0.jpg                     (Villa - Main Center)
+├── 1.jpg                     (Bedroom 1 - Bridge to /villa/1)
+├── 2.jpg                     (Bedroom 2 - Bridge to /villa/2)
+│
+├── 1/                        (Bedroom 1)
+│   ├── 0.jpg                 (Bedroom 1 - Local Center)
+│   └── 1.jpg                 (Bathroom 1 - Bridge to /villa/1/1)
+│       └── 1/                (Bathroom 1)
+│           └── 0.jpg         (Bathroom 1 - Local Center)
+```
+Argus reconstructs the deepest subfolders first, computes $\operatorname{Sim}(3)$ coordinate alignment and median depth scaling across bridge panoramas, and merges all geometries into the root coordinate system.
+
+```bash
+uv run python infer.py \
+  --input "/path/to/villa" \
+  --output ./output \
+  --nested \
+  --dense-resize 4k \
+  --splat \
+  --ceiling_remove 25 \
+  --debug
+```
 
 ## Interactive Demo
 

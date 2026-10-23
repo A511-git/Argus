@@ -152,12 +152,27 @@ def parse_args():
         help="Export per-panorama debug models (<scene_name>_<idx>_pointcloud.ply and <scene_name>_<idx>_splat.ply) in world coordinates."
     )
     parser.add_argument(
+        "--nested",
+        action="store_true",
+        default=False,
+        help="Enable hierarchical multi-step reconstruction for nested scene folders (e.g. /villa/1/1)."
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
         help="Device to use: 'cuda', 'cpu', or None for auto-detection."
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Auto-enable dense upsampling if user passed --dense-resize / --dense_resize or customized it
+    import sys
+    if any(arg.startswith(("--dense-resize", "--dense_resize", "-dense-resize")) for arg in sys.argv):
+        args.dense = True
+    elif args.dense_resize.strip().lower() not in ("2048", "2k"):
+        args.dense = True
+
+    return args
 
 
 # -------------------------- Scene Discovery --------------------------
@@ -723,12 +738,17 @@ def build_multiview_gaussian_splats(
         all_scales.append(log_scales[valid])
         all_quats.append(quats[valid])
 
-    flat_pts = torch.cat(all_pts, dim=0)
-    flat_rgb = torch.cat(all_rgb, dim=0)
-    flat_scales = torch.cat(all_scales, dim=0)
-    flat_quats = torch.cat(all_quats, dim=0)
+    flat_pts = torch.cat(all_pts, dim=0) if all_pts else torch.empty((0, 3), device=device)
+    flat_rgb = torch.cat(all_rgb, dim=0) if all_rgb else torch.empty((0, 3), device=device)
+    flat_scales = torch.cat(all_scales, dim=0) if all_scales else torch.empty((0, 3), device=device)
+    flat_quats = torch.cat(all_quats, dim=0) if all_quats else torch.empty((0, 4), device=device)
 
-    return flat_pts, flat_rgb, flat_scales, flat_quats
+    per_view_splats = [
+        (all_pts[v], all_rgb[v], all_scales[v], all_quats[v])
+        for v in range(num_views)
+    ]
+
+    return flat_pts, flat_rgb, flat_scales, flat_quats, per_view_splats
 
 
 # -------------------------- 3D Visualization Helpers --------------------------
@@ -832,7 +852,11 @@ def process_scene(
     print(f"Processing Scene: {clean_scene_name} ({len(image_paths)} panoramas)")
     print(f"========================================================")
 
-    scene_out_dir = output_dir / clean_scene_name
+    output_dir = Path(output_dir)
+    if output_dir.name == clean_scene_name:
+        scene_out_dir = output_dir
+    else:
+        scene_out_dir = output_dir / clean_scene_name
     scene_out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Preprocess images
@@ -921,14 +945,20 @@ def process_scene(
             max_dense_width=max_dense_w,
             device=device
         )
+        pts_per_view = world_pts_dense  # [S, H_crop, W, 3]
+        colors_per_view = np.stack(dense_colors)  # [S, H_crop, W, 3]
+        confs_per_view = np.stack(dense_confs)  # [S, H_crop, W]
     else:
         print("Building standard resolution point cloud...")
-        vertices_3d = np_predictions["world_points_from_depth"].reshape(-1, 3)
+        pts_per_view = np_predictions["world_points_from_depth"]  # [S, H, W, 3]
         images_rgb = np_predictions["images"]
         if images_rgb.ndim == 4 and images_rgb.shape[1] == 3:  # NCHW -> NHWC
             images_rgb = np.transpose(images_rgb, (0, 2, 3, 1))
-        colors_rgb = (images_rgb.reshape(-1, 3) * 255.0).astype(np.uint8)
-        conf = np_predictions["depth_conf"].reshape(-1)
+        colors_per_view = (images_rgb * 255.0).astype(np.uint8)  # [S, H, W, 3]
+        confs_per_view = np_predictions["depth_conf"]  # [S, H, W]
+        vertices_3d = pts_per_view.reshape(-1, 3)
+        colors_rgb = colors_per_view.reshape(-1, 3)
+        conf = confs_per_view.reshape(-1)
 
     raw_count = len(vertices_3d)
 
@@ -983,7 +1013,7 @@ def process_scene(
         extri_tensor = torch.from_numpy(np.ascontiguousarray(extrinsics_np))
 
         t_sp = time.perf_counter()
-        sp_pts, sp_rgb, sp_sc, sp_qt = build_multiview_gaussian_splats(
+        sp_pts, sp_rgb, sp_sc, sp_qt, splat_per_view = build_multiview_gaussian_splats(
             depth_maps=splat_depths,
             rgb_images=splat_rgbs,
             extrinsics=extri_tensor,
@@ -999,6 +1029,25 @@ def process_scene(
             device=device
         )
         print(f"Generated {len(sp_pts):,} Gaussian Splats in {time.perf_counter() - t_sp:.2f}s")
+
+        # Apply ceiling removal to splats if requested
+        if args.ceiling_remove > 0.0 and y_cut is not None:
+            if len(sp_pts) > 0:
+                mask_ceil = sp_pts[:, 1] > y_cut
+                sp_pts = sp_pts[mask_ceil]
+                sp_rgb = sp_rgb[mask_ceil]
+                sp_sc = sp_sc[mask_ceil]
+                sp_qt = sp_qt[mask_ceil]
+            if splat_per_view is not None:
+                filtered_spv = []
+                for sp_p_i, sp_c_i, sp_s_i, sp_q_i in splat_per_view:
+                    if len(sp_p_i) > 0:
+                        m_c = sp_p_i[:, 1] > y_cut
+                        filtered_spv.append((sp_p_i[m_c], sp_c_i[m_c], sp_s_i[m_c], sp_q_i[m_c]))
+                    else:
+                        filtered_spv.append((sp_p_i, sp_c_i, sp_s_i, sp_q_i))
+                splat_per_view = filtered_spv
+
         save_gaussian_splat_ply(
             filepath=splat_path,
             points=sp_pts,
@@ -1007,6 +1056,8 @@ def process_scene(
             quats=sp_qt
         )
         print(f"Exported Gaussian Splats to: {splat_path}")
+    else:
+        sp_pts, sp_rgb, sp_sc, sp_qt, splat_per_view = None, None, None, None, None
 
     # 10. Optional GLB Export (<clean_scene_name>.glb)
     if args.export_glb:
@@ -1034,40 +1085,6 @@ def process_scene(
         debug_dir = scene_out_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-        if args.dense and dense_depths is not None and world_pts_dense is not None:
-            pts_per_view = world_pts_dense  # [S, H_crop, W, 3]
-            colors_per_view = np.stack(dense_colors)  # [S, H_crop, W, 3]
-            confs_per_view = np.stack(dense_confs)  # [S, H_crop, W]
-        else:
-            pts_per_view = np_predictions["world_points_from_depth"]  # [S, H, W, 3]
-            images_rgb_arr = np_predictions["images"]
-            if images_rgb_arr.ndim == 4 and images_rgb_arr.shape[1] == 3:
-                images_rgb_arr = np.transpose(images_rgb_arr, (0, 2, 3, 1))
-            colors_per_view = (images_rgb_arr * 255.0).astype(np.uint8)  # [S, H, W, 3]
-            confs_per_view = np_predictions["depth_conf"]  # [S, H, W]
-
-        # Prepare splat data if not already prepared
-        if "splat_depths" not in locals():
-            if args.dense and dense_depths is not None:
-                splat_depths = [torch.from_numpy(np.ascontiguousarray(d)) for d in dense_depths]
-                splat_rgbs = [torch.from_numpy(np.ascontiguousarray(c)) for c in dense_colors]
-                splat_confs = [torch.from_numpy(np.ascontiguousarray(c)) for c in dense_confs] if dense_confs is not None else None
-            else:
-                splat_depths = [
-                    torch.from_numpy(np.ascontiguousarray(np_predictions["depth"][i].squeeze(-1)))
-                    for i in range(len(image_paths))
-                ]
-                splat_rgbs = [
-                    torch.from_numpy(np.ascontiguousarray((np_predictions["images"][i].transpose(1, 2, 0) * 255.0).astype(np.uint8)))
-                    for i in range(len(image_paths))
-                ]
-                splat_confs = [
-                    torch.from_numpy(np.ascontiguousarray(np_predictions["depth_conf"][i]))
-                    for i in range(len(image_paths))
-                ] if "depth_conf" in np_predictions else None
-
-        extri_tensor = torch.from_numpy(np.ascontiguousarray(extrinsics_np))
-
         for idx, img_path in enumerate(image_paths):
             view_num = idx + 1
             # Maintain folder structure: debug / <scene_name> <view_num>
@@ -1094,41 +1111,50 @@ def process_scene(
             write_ply(str(pcd_file), p_view, c_view, binary=True)
 
             # 2. Per-panorama Gaussian Splat: <clean_scene_name>_<view_num>_splat.ply
-            sp_pts_i, sp_rgb_i, sp_sc_i, sp_qt_i = build_multiview_gaussian_splats(
-                depth_maps=[splat_depths[idx]],
-                rgb_images=[splat_rgbs[idx]],
-                extrinsics=extri_tensor[idx:idx+1],
-                crop_ratio=args.crop_ratio,
-                conf_maps=[splat_confs[idx]] if splat_confs is not None else None,
-                min_conf=conf_cut_val,
-                stride=args.ply_stride,
-                is_indoor=args.ply_is_indoor,
-                global_scale=args.ply_scale,
-                disc_thickness=args.ply_thickness,
-                min_depth=args.ply_min_depth,
-                max_depth=args.ply_max_depth,
-                device=device
-            )
-
-            if args.ceiling_remove > 0.0 and y_cut is not None and len(sp_pts_i) > 0:
-                mask_ceil = sp_pts_i[:, 1] > y_cut
-                sp_pts_i = sp_pts_i[mask_ceil]
-                sp_rgb_i = sp_rgb_i[mask_ceil]
-                sp_sc_i = sp_sc_i[mask_ceil]
-                sp_qt_i = sp_qt_i[mask_ceil]
-
-            splat_file = view_dir / f"{clean_scene_name}_{view_num}_splat.ply"
-            save_gaussian_splat_ply(
-                filepath=splat_file,
-                points=sp_pts_i,
-                colors=sp_rgb_i,
-                scales=sp_sc_i,
-                quats=sp_qt_i
-            )
+            if args.splat and splat_per_view is not None:
+                sp_pts_i, sp_rgb_i, sp_sc_i, sp_qt_i = splat_per_view[idx]
+                splat_file = view_dir / f"{clean_scene_name}_{view_num}_splat.ply"
+                save_gaussian_splat_ply(
+                    filepath=splat_file,
+                    points=sp_pts_i,
+                    colors=sp_rgb_i,
+                    scales=sp_sc_i,
+                    quats=sp_qt_i
+                )
 
             print(f"  • View {view_num}/{len(image_paths)} ({img_path.name}) exported to: {view_dir.relative_to(scene_out_dir)}")
 
     print(f"Scene '{clean_scene_name}' completed successfully.")
+
+    if dense_depths is not None:
+        depths_list = dense_depths
+        colors_list = dense_colors
+        confs_list = dense_confs
+    else:
+        depths_list = [np_predictions["depth"][i].squeeze(-1) for i in range(len(image_paths))]
+        colors_list = [colors_per_view[i] for i in range(len(image_paths))]
+        confs_list = [confs_per_view[i] for i in range(len(image_paths))]
+
+    return {
+        "merged_vertices_3d": vertices_3d,
+        "merged_colors_rgb": colors_rgb,
+        "merged_conf": conf,
+        "pts_per_view": pts_per_view,
+        "colors_per_view": colors_per_view,
+        "confs_per_view": confs_per_view,
+        "dense_depths": depths_list,
+        "dense_colors": colors_list,
+        "dense_confs": confs_list,
+        "extrinsics_np": extrinsics_np,
+        "camera_poses": camera_poses_data,
+        "merged_splat_points": sp_pts if args.splat else None,
+        "merged_splat_colors": sp_rgb if args.splat else None,
+        "merged_splat_scales": sp_sc if args.splat else None,
+        "merged_splat_quats": sp_qt if args.splat else None,
+        "splat_per_view": splat_per_view if args.splat else None,
+        "conf_cut_val": conf_cut_val,
+        "y_cut": y_cut,
+    }
 
 
 # -------------------------- Main Routine --------------------------
@@ -1147,9 +1173,46 @@ def main():
     model_weight_path = resolve_model_path(args.model_path)
     model = load_model(model_weight_path, device=device)
 
-    # 3. Process each scene
+    # 3. Process scenes (Nested Hierarchical Mode vs Flat Mode)
     output_root = Path(args.output).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+
+    if args.nested:
+        from utils.nested_recon import parse_nested_scene_tree, process_nested_scene
+
+        root_path = Path(args.input).resolve()
+        scene_tree = parse_nested_scene_tree(root_path)
+        if scene_tree is None or len(scene_tree.images) == 0:
+            raise ValueError(f"Could not parse valid nested scene tree from '{args.input}'")
+
+        print(f"\n========================================================")
+        print(f"Hierarchical Nested Reconstruction Starting for: {scene_tree.name}")
+        print(f"========================================================")
+
+        def infer_wrapper(scene_name, image_paths, output_dir, device, args):
+            return process_scene(
+                scene_name=scene_name,
+                image_paths=image_paths,
+                output_dir=output_dir,
+                model=model,
+                device=device,
+                args=args
+            )
+
+        total_start = time.time()
+        process_nested_scene(
+            node=scene_tree,
+            infer_fn=infer_wrapper,
+            output_root=output_root,
+            args=args,
+            device=device,
+            matrix_to_quaternion_fn=matrix_to_quaternion
+        )
+        print(f"\n========================================================")
+        print(f"Nested hierarchical reconstruction completed in {time.time() - total_start:.2f}s.")
+        print(f"Results stored under: {output_root}")
+        print(f"========================================================\n")
+        return
 
     total_start = time.time()
     for scene_name, image_paths in scenes:
