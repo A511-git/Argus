@@ -153,6 +153,7 @@ output/
 | :--- | :---: | :---: | :--- |
 | `--export_glb` | `flag` | `False` | Export interactive 3D trimesh scene as `<scene_name>.glb`. |
 | `--show_cam` / `--no-show_cam` | `bool` | `True` | Include 3D color-coded camera cone frustums at estimated camera positions inside the GLB scene. |
+| `--debug` | `flag` | `False` | Export per-panorama point clouds and splats inside `<scene>/debug/<scene> <idx>/` in aligned world coordinates. |
 
 ## Interactive Demo
 

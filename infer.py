@@ -146,6 +146,12 @@ def parse_args():
         help="Whether to include 3D camera cones in the exported GLB scene (default: True)."
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Export per-panorama debug models (<scene_name>_<idx>_pointcloud.ply and <scene_name>_<idx>_splat.ply) in world coordinates."
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -456,7 +462,7 @@ def build_dense_pointcloud(
     colors_flat = np.stack(dense_colors).reshape(-1, 3)
     confs_flat = np.stack(dense_confs).reshape(-1)
 
-    return pts_flat, colors_flat, confs_flat, dense_depths, dense_colors, dense_confs
+    return pts_flat, colors_flat, confs_flat, dense_depths, dense_colors, dense_confs, world_pts
 
 
 # -------------------------- 3D Gaussian Splatting (GPU Accelerated) --------------------------
@@ -902,10 +908,11 @@ def process_scene(
     dense_depths = None
     dense_colors = None
     dense_confs = None
+    world_pts_dense = None
     if args.dense:
         max_dense_w = parse_dense_resize(args.dense_resize)
         print(f"Building high-resolution DENSE point cloud via guided depth upsampling (cap: {args.dense_resize})...")
-        vertices_3d, colors_rgb, conf, dense_depths, dense_colors, dense_confs = build_dense_pointcloud(
+        vertices_3d, colors_rgb, conf, dense_depths, dense_colors, dense_confs, world_pts_dense = build_dense_pointcloud(
             raw_images_bgr=raw_images_bgr,
             low_depth=np_predictions["depth"],
             low_conf=np_predictions["depth_conf"],
@@ -933,8 +940,9 @@ def process_scene(
         vertices_3d = vertices_3d[mask]
         colors_rgb = colors_rgb[mask]
 
+    y_cut = None
     if args.ceiling_remove > 0.0 and len(vertices_3d) > 0:
-        y_cut = np.percentile(vertices_3d[:, 1], args.ceiling_remove)
+        y_cut = float(np.percentile(vertices_3d[:, 1], args.ceiling_remove))
         mask_ceil = vertices_3d[:, 1] > y_cut
         vertices_3d = vertices_3d[mask_ceil]
         colors_rgb = colors_rgb[mask_ceil]
@@ -1019,6 +1027,106 @@ def process_scene(
             print(f"Exported interactive GLB scene to: {glb_path}")
         except ImportError:
             print("Note: 'trimesh' not installed. Skipping .glb export.")
+
+    # 11. Optional Debug Per-Panorama Export (--debug)
+    if args.debug:
+        print("\nExporting per-panorama debug models (point clouds & splats)...")
+        debug_dir = scene_out_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.dense and dense_depths is not None and world_pts_dense is not None:
+            pts_per_view = world_pts_dense  # [S, H_crop, W, 3]
+            colors_per_view = np.stack(dense_colors)  # [S, H_crop, W, 3]
+            confs_per_view = np.stack(dense_confs)  # [S, H_crop, W]
+        else:
+            pts_per_view = np_predictions["world_points_from_depth"]  # [S, H, W, 3]
+            images_rgb_arr = np_predictions["images"]
+            if images_rgb_arr.ndim == 4 and images_rgb_arr.shape[1] == 3:
+                images_rgb_arr = np.transpose(images_rgb_arr, (0, 2, 3, 1))
+            colors_per_view = (images_rgb_arr * 255.0).astype(np.uint8)  # [S, H, W, 3]
+            confs_per_view = np_predictions["depth_conf"]  # [S, H, W]
+
+        # Prepare splat data if not already prepared
+        if "splat_depths" not in locals():
+            if args.dense and dense_depths is not None:
+                splat_depths = [torch.from_numpy(np.ascontiguousarray(d)) for d in dense_depths]
+                splat_rgbs = [torch.from_numpy(np.ascontiguousarray(c)) for c in dense_colors]
+                splat_confs = [torch.from_numpy(np.ascontiguousarray(c)) for c in dense_confs] if dense_confs is not None else None
+            else:
+                splat_depths = [
+                    torch.from_numpy(np.ascontiguousarray(np_predictions["depth"][i].squeeze(-1)))
+                    for i in range(len(image_paths))
+                ]
+                splat_rgbs = [
+                    torch.from_numpy(np.ascontiguousarray((np_predictions["images"][i].transpose(1, 2, 0) * 255.0).astype(np.uint8)))
+                    for i in range(len(image_paths))
+                ]
+                splat_confs = [
+                    torch.from_numpy(np.ascontiguousarray(np_predictions["depth_conf"][i]))
+                    for i in range(len(image_paths))
+                ] if "depth_conf" in np_predictions else None
+
+        extri_tensor = torch.from_numpy(np.ascontiguousarray(extrinsics_np))
+
+        for idx, img_path in enumerate(image_paths):
+            view_num = idx + 1
+            # Maintain folder structure: debug / <scene_name> <view_num>
+            view_folder_name = f"{scene_name} {view_num}"
+            view_dir = debug_dir / view_folder_name
+            view_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Per-panorama Point Cloud: <clean_scene_name>_<view_num>_pointcloud.ply
+            p_view = pts_per_view[idx].reshape(-1, 3)
+            c_view = colors_per_view[idx].reshape(-1, 3)
+            conf_view = confs_per_view[idx].reshape(-1)
+
+            if conf_cut_val is not None:
+                mask = (conf_view >= conf_cut_val) & (conf_view > 1e-5)
+                p_view = p_view[mask]
+                c_view = c_view[mask]
+
+            if args.ceiling_remove > 0.0 and y_cut is not None and len(p_view) > 0:
+                mask_ceil = p_view[:, 1] > y_cut
+                p_view = p_view[mask_ceil]
+                c_view = c_view[mask_ceil]
+
+            pcd_file = view_dir / f"{clean_scene_name}_{view_num}_pointcloud.ply"
+            write_ply(str(pcd_file), p_view, c_view, binary=True)
+
+            # 2. Per-panorama Gaussian Splat: <clean_scene_name>_<view_num>_splat.ply
+            sp_pts_i, sp_rgb_i, sp_sc_i, sp_qt_i = build_multiview_gaussian_splats(
+                depth_maps=[splat_depths[idx]],
+                rgb_images=[splat_rgbs[idx]],
+                extrinsics=extri_tensor[idx:idx+1],
+                crop_ratio=args.crop_ratio,
+                conf_maps=[splat_confs[idx]] if splat_confs is not None else None,
+                min_conf=conf_cut_val,
+                stride=args.ply_stride,
+                is_indoor=args.ply_is_indoor,
+                global_scale=args.ply_scale,
+                disc_thickness=args.ply_thickness,
+                min_depth=args.ply_min_depth,
+                max_depth=args.ply_max_depth,
+                device=device
+            )
+
+            if args.ceiling_remove > 0.0 and y_cut is not None and len(sp_pts_i) > 0:
+                mask_ceil = sp_pts_i[:, 1] > y_cut
+                sp_pts_i = sp_pts_i[mask_ceil]
+                sp_rgb_i = sp_rgb_i[mask_ceil]
+                sp_sc_i = sp_sc_i[mask_ceil]
+                sp_qt_i = sp_qt_i[mask_ceil]
+
+            splat_file = view_dir / f"{clean_scene_name}_{view_num}_splat.ply"
+            save_gaussian_splat_ply(
+                filepath=splat_file,
+                points=sp_pts_i,
+                colors=sp_rgb_i,
+                scales=sp_sc_i,
+                quats=sp_qt_i
+            )
+
+            print(f"  • View {view_num}/{len(image_paths)} ({img_path.name}) exported to: {view_dir.relative_to(scene_out_dir)}")
 
     print(f"Scene '{clean_scene_name}' completed successfully.")
 
