@@ -456,10 +456,70 @@ def build_dense_pointcloud(
     colors_flat = np.stack(dense_colors).reshape(-1, 3)
     confs_flat = np.stack(dense_confs).reshape(-1)
 
-    return pts_flat, colors_flat, confs_flat, dense_depths, dense_colors
+    return pts_flat, colors_flat, confs_flat, dense_depths, dense_colors, dense_confs
 
 
 # -------------------------- 3D Gaussian Splatting (GPU Accelerated) --------------------------
+def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 3x3 rotation matrices to unit quaternions [qw, qx, qy, qz].
+    Vectorized on GPU using Shepperd's algorithm. Numerically stable across all SO(3) rotations.
+    """
+    m00 = matrix[..., 0, 0]
+    m01 = matrix[..., 0, 1]
+    m02 = matrix[..., 0, 2]
+    m10 = matrix[..., 1, 0]
+    m11 = matrix[..., 1, 1]
+    m12 = matrix[..., 1, 2]
+    m20 = matrix[..., 2, 0]
+    m21 = matrix[..., 2, 1]
+    m22 = matrix[..., 2, 2]
+
+    trace = m00 + m11 + m22
+
+    # 4 choices for largest diagonal term to avoid division by near-zero
+    t0 = 1.0 + trace
+    t1 = 1.0 + m00 - m11 - m22
+    t2 = 1.0 - m00 + m11 - m22
+    t3 = 1.0 - m00 - m11 + m22
+
+    # Case 0: trace is largest
+    q0_w = 0.5 * torch.sqrt(torch.clamp(t0, min=1e-8))
+    q0_x = (m21 - m12) / (4.0 * q0_w)
+    q0_y = (m02 - m20) / (4.0 * q0_w)
+    q0_z = (m10 - m01) / (4.0 * q0_w)
+    q0 = torch.stack([q0_w, q0_x, q0_y, q0_z], dim=-1)
+
+    # Case 1: m00 is largest
+    q1_x = 0.5 * torch.sqrt(torch.clamp(t1, min=1e-8))
+    q1_w = (m21 - m12) / (4.0 * q1_x)
+    q1_y = (m01 + m10) / (4.0 * q1_x)
+    q1_z = (m02 + m20) / (4.0 * q1_x)
+    q1 = torch.stack([q1_w, q1_x, q1_y, q1_z], dim=-1)
+
+    # Case 2: m11 is largest
+    q2_y = 0.5 * torch.sqrt(torch.clamp(t2, min=1e-8))
+    q2_w = (m02 - m20) / (4.0 * q2_y)
+    q2_x = (m01 + m10) / (4.0 * q2_y)
+    q2_z = (m12 + m21) / (4.0 * q2_y)
+    q2 = torch.stack([q2_w, q2_x, q2_y, q2_z], dim=-1)
+
+    # Case 3: m22 is largest
+    q3_z = 0.5 * torch.sqrt(torch.clamp(t3, min=1e-8))
+    q3_w = (m10 - m01) / (4.0 * q3_z)
+    q3_x = (m02 + m20) / (4.0 * q3_z)
+    q3_y = (m12 + m21) / (4.0 * q3_z)
+    q3 = torch.stack([q3_w, q3_x, q3_y, q3_z], dim=-1)
+
+    t_stack = torch.stack([t0, t1, t2, t3], dim=-1)
+    max_idx = torch.argmax(t_stack, dim=-1, keepdim=True)
+    q_stack = torch.stack([q0, q1, q2, q3], dim=-2)  # [..., 4, 4]
+
+    quat = torch.gather(q_stack, -2, max_idx.unsqueeze(-1).expand(*max_idx.shape[:-1], 1, 4)).squeeze(-2)
+    quat = quat / torch.clamp(torch.norm(quat, dim=-1, keepdim=True), min=1e-8)
+    return quat
+
+
 def save_gaussian_splat_ply(
     filepath: Union[str, Path],
     points: torch.Tensor,
@@ -539,6 +599,9 @@ def build_multiview_gaussian_splats(
     depth_maps: List[torch.Tensor],    # List of [H, W] float32 depth tensors
     rgb_images: List[torch.Tensor],    # List of [H, W, 3] uint8/float32 RGB tensors
     extrinsics: torch.Tensor,          # [S, 3, 4] or [S, 4, 4]
+    crop_ratio: float = 0.15,
+    conf_maps: Optional[List[torch.Tensor]] = None,
+    min_conf: Optional[float] = None,
     stride: int = 1,
     is_indoor: bool = True,
     global_scale: float = 1.2,
@@ -550,6 +613,12 @@ def build_multiview_gaussian_splats(
     """
     100% GPU-Accelerated conversion of multi-view panoramic depth and RGB images into
     unified, world-space 3D Gaussian Splats.
+
+    Mathematically aligned with Argus panoramic spherical coordinates:
+      lat: latitude compensated for crop_ratio
+      long: longitude across full 360 panorama
+      Camera frame: Y is vertical, +Z is forward, X is lateral.
+      Splat local frame: [t_long, t_lat, dirs] with right-handed SO(3) basis (det = +1).
     """
     if max_depth is None:
         max_depth = 15.0 if is_indoor else 80.0
@@ -564,36 +633,59 @@ def build_multiview_gaussian_splats(
         if stride > 1:
             d_t = d_t[::stride, ::stride]
             rgb_t = rgb_t[::stride, ::stride]
+            c_t = conf_maps[i][::stride, ::stride].to(device=device) if conf_maps is not None else None
+        else:
+            c_t = conf_maps[i].to(device=device) if conf_maps is not None else None
 
         H, W = d_t.shape[:2]
 
-        u = (torch.arange(W, dtype=torch.float32, device=device) + 0.5) / W
-        v = (torch.arange(H, dtype=torch.float32, device=device) + 0.5) / H
-        v_grid, u_grid = torch.meshgrid(v, u, indexing="ij")
+        # The input depth/rgb is cropped vertically by crop_ratio.
+        # Original uncropped panorama aspect ratio is 2:1 (W_full, H_full = W_full // 2).
+        W_full = W * stride
+        H_full = W_full // 2
+        top_crop = int(H_full * crop_ratio)
 
-        theta = (1.0 - u_grid) * (2.0 * torch.pi)
-        phi = v_grid * torch.pi
+        # Pixel grid sampling centered in each cell
+        px = (torch.arange(W, dtype=torch.float32, device=device) + 0.5) * stride
+        py = (torch.arange(H, dtype=torch.float32, device=device) + 0.5) * stride
+        py_grid, px_grid = torch.meshgrid(py, px, indexing="ij")
 
-        sin_phi = torch.sin(phi)
-        cos_phi = torch.cos(phi)
-        sin_theta = torch.sin(theta)
-        cos_theta = torch.cos(theta)
+        # Map to original spherical coordinates matching Argus geometry.py:
+        py_ori = py_grid + top_crop
+        lat = (py_ori / H_full - 0.5) * torch.pi
+        long = (px_grid / W_full - 0.5) * (2.0 * torch.pi)
 
-        dx = sin_phi * cos_theta
-        dy = sin_phi * sin_theta
-        dz = cos_phi
+        cos_lat = torch.cos(lat)
+        sin_lat = torch.sin(lat)
+        cos_long = torch.cos(long)
+        sin_long = torch.sin(long)
 
-        dirs = torch.stack([dx, dy, dz], dim=-1)  # [H, W, 3] local ray directions
-        pts_cam = dirs * d_t.unsqueeze(-1)        # [H, W, 3] local 3D points
+        # Camera frame unit ray direction [H, W, 3]:
+        # y = sin(lat) (vertical)
+        # x = cos(lat) * sin(long) (lateral)
+        # z = cos(lat) * cos(long) (forward)
+        dx = cos_lat * sin_long
+        dy = sin_lat
+        dz = cos_lat * cos_long
+        dirs = torch.stack([dx, dy, dz], dim=-1)
 
-        t1 = torch.stack([-sin_theta, cos_theta, torch.zeros_like(theta)], dim=-1)
-        t2 = torch.stack([cos_phi * cos_theta, cos_phi * sin_theta, -sin_phi], dim=-1)
+        # Local 3D points in camera frame
+        pts_cam = dirs * d_t.unsqueeze(-1)
 
-        d_theta = (2.0 * torch.pi) / W
-        d_phi = torch.pi / H
+        # Right-handed orthonormal tangent basis:
+        # t_long: tangent along longitude (horizontal u direction)
+        # t_lat:  tangent along latitude  (vertical v direction)
+        # dirs:   radial ray direction (normal to sphere)
+        # Note: t_long x t_lat == dirs exactly, yielding det = +1
+        t_long = torch.stack([cos_long, torch.zeros_like(long), -sin_long], dim=-1)
+        t_lat = torch.stack([-sin_lat * sin_long, cos_lat, -sin_lat * cos_long], dim=-1)
 
-        s1 = d_t * (d_theta * torch.clamp(sin_phi, min=1e-3)) * global_scale
-        s2 = d_t * (d_phi * global_scale)
+        # Differential metric scales on the spherical patch
+        d_long = (2.0 * torch.pi / W_full) * stride
+        d_lat = (torch.pi / H_full) * stride
+
+        s1 = d_t * (cos_lat * d_long) * global_scale
+        s2 = d_t * (d_lat * global_scale)
         s3 = disc_thickness * torch.minimum(s1, s2)
 
         scales = torch.stack([s1, s2, s3], dim=-1)
@@ -606,26 +698,19 @@ def build_multiview_gaussian_splats(
         # P_world = P_cam @ R.T + t
         pts_world = torch.matmul(pts_cam, R.T) + t
 
-        # Rotate tangent frame into world coordinates
-        t1_w = torch.matmul(t1, R.T)
-        t2_w = torch.matmul(t2, R.T)
+        # Rotate tangent frame into world coordinates:
+        t_long_w = torch.matmul(t_long, R.T)
+        t_lat_w = torch.matmul(t_lat, R.T)
         dirs_w = torch.matmul(dirs, R.T)
 
-        R00, R01, R02 = t1_w[..., 0], t2_w[..., 0], dirs_w[..., 0]
-        R10, R11, R12 = t1_w[..., 1], t2_w[..., 1], dirs_w[..., 1]
-        R20, R21, R22 = t1_w[..., 2], t2_w[..., 2], dirs_w[..., 2]
+        # Construct SO(3) splat rotation matrix with columns [t_long_w, t_lat_w, dirs_w]
+        R_splat = torch.stack([t_long_w, t_lat_w, dirs_w], dim=-1)  # [H, W, 3, 3]
+        quats = matrix_to_quaternion(R_splat)
 
-        tr = R00 + R11 + R22
-        qw = torch.sqrt(torch.clamp(1.0 + tr, min=0.0)) / 2.0
-        denom = 4.0 * torch.clamp(qw, min=1e-6)
-        qx = (R21 - R12) / denom
-        qy = (R02 - R20) / denom
-        qz = (R10 - R01) / denom
-
-        quats = torch.stack([qw, qx, qy, qz], dim=-1)
-        quats = quats / torch.clamp(torch.norm(quats, dim=-1, keepdim=True), min=1e-6)
-
+        # Validity mask: depth within range and valid confidence
         valid = torch.isfinite(d_t) & (d_t >= min_depth) & (d_t <= max_depth)
+        if c_t is not None and min_conf is not None and min_conf > 0.0:
+            valid = valid & (c_t >= min_conf) & (c_t > 1e-5)
 
         all_pts.append(pts_world[valid])
         all_rgb.append(rgb_t[valid])
@@ -816,10 +901,11 @@ def process_scene(
     # 6. Build Point Cloud (Standard or Dense)
     dense_depths = None
     dense_colors = None
+    dense_confs = None
     if args.dense:
         max_dense_w = parse_dense_resize(args.dense_resize)
         print(f"Building high-resolution DENSE point cloud via guided depth upsampling (cap: {args.dense_resize})...")
-        vertices_3d, colors_rgb, conf, dense_depths, dense_colors = build_dense_pointcloud(
+        vertices_3d, colors_rgb, conf, dense_depths, dense_colors, dense_confs = build_dense_pointcloud(
             raw_images_bgr=raw_images_bgr,
             low_depth=np_predictions["depth"],
             low_conf=np_predictions["depth_conf"],
@@ -840,9 +926,10 @@ def process_scene(
     raw_count = len(vertices_3d)
 
     # 7. Confidence & Ceiling Filtering
+    conf_cut_val = None
     if args.conf_thres > 0.0:
-        conf_cut = np.percentile(conf, args.conf_thres)
-        mask = (conf >= conf_cut) & (conf > 1e-5)
+        conf_cut_val = float(np.percentile(conf, args.conf_thres))
+        mask = (conf >= conf_cut_val) & (conf > 1e-5)
         vertices_3d = vertices_3d[mask]
         colors_rgb = colors_rgb[mask]
 
@@ -870,6 +957,7 @@ def process_scene(
         if args.dense and dense_depths is not None:
             splat_depths = [torch.from_numpy(np.ascontiguousarray(d)) for d in dense_depths]
             splat_rgbs = [torch.from_numpy(np.ascontiguousarray(c)) for c in dense_colors]
+            splat_confs = [torch.from_numpy(np.ascontiguousarray(c)) for c in dense_confs] if dense_confs is not None else None
         else:
             splat_depths = [
                 torch.from_numpy(np.ascontiguousarray(np_predictions["depth"][i].squeeze(-1)))
@@ -879,6 +967,10 @@ def process_scene(
                 torch.from_numpy(np.ascontiguousarray((np_predictions["images"][i].transpose(1, 2, 0) * 255.0).astype(np.uint8)))
                 for i in range(len(image_paths))
             ]
+            splat_confs = [
+                torch.from_numpy(np.ascontiguousarray(np_predictions["depth_conf"][i]))
+                for i in range(len(image_paths))
+            ] if "depth_conf" in np_predictions else None
 
         extri_tensor = torch.from_numpy(np.ascontiguousarray(extrinsics_np))
 
@@ -887,6 +979,9 @@ def process_scene(
             depth_maps=splat_depths,
             rgb_images=splat_rgbs,
             extrinsics=extri_tensor,
+            crop_ratio=args.crop_ratio,
+            conf_maps=splat_confs,
+            min_conf=conf_cut_val,
             stride=args.ply_stride,
             is_indoor=args.ply_is_indoor,
             global_scale=args.ply_scale,
