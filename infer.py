@@ -969,6 +969,7 @@ def process_scene(
         mask = (conf >= conf_cut_val) & (conf > 1e-5)
         vertices_3d = vertices_3d[mask]
         colors_rgb = colors_rgb[mask]
+        conf = conf[mask]
 
     y_cut = None
     if args.ceiling_remove > 0.0 and len(vertices_3d) > 0:
@@ -976,6 +977,7 @@ def process_scene(
         mask_ceil = vertices_3d[:, 1] > y_cut
         vertices_3d = vertices_3d[mask_ceil]
         colors_rgb = colors_rgb[mask_ceil]
+        conf = conf[mask_ceil]
 
     final_count = len(vertices_3d)
     print(f"Point count: {final_count:,} (pruned {raw_count - final_count:,} noisy/ceiling points)")

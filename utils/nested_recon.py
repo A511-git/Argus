@@ -415,7 +415,10 @@ def process_nested_scene(
             m_ceil = child_pts_transformed[:, 1] > y_cut
             child_pts_transformed = child_pts_transformed[m_ceil]
             child_clr = child_clr[m_ceil]
-            child_cnf = child_cnf[m_ceil]
+            if child_cnf is not None and len(child_cnf) == len(m_ceil):
+                child_cnf = child_cnf[m_ceil]
+            else:
+                child_cnf = np.ones(len(child_pts_transformed), dtype=np.float32)
 
         merged_points.append(child_pts_transformed)
         merged_colors.append(child_clr)
@@ -473,7 +476,10 @@ def process_nested_scene(
         m_ceil = final_vertices[:, 1] > y_cut
         final_vertices = final_vertices[m_ceil]
         final_colors = final_colors[m_ceil]
-        final_conf = final_conf[m_ceil]
+        if final_conf is not None and len(final_conf) == len(m_ceil):
+            final_conf = final_conf[m_ceil]
+        else:
+            final_conf = np.ones(len(final_vertices), dtype=np.float32)
 
     # Save merged Point Cloud
     ply_filename = f"{clean_node_name}.ply"
